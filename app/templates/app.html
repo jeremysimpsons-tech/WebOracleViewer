@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <meta name="robots" content="noindex, nofollow">
+  <title>E1P DB Viewer</title>
+  <link rel="icon" href="/static/favicon.svg?v=4" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <script src="/static/js/theme.js?v=4"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="mark" src="/static/favicon.svg?v=4" alt="">
+      <strong>E1P DB Viewer</strong>
+    </div>
+    <label class="conn-switch">
+      <span>Working connection</span>
+      <select id="conn-select" aria-label="Working connection"></select>
+    </label>
+    <div id="conn-meta" class="conn-meta">Not connected</div>
+    <button id="btn-disconnect" type="button" class="ghost">Disconnect</button>
+    <button id="btn-settings" type="button" class="ghost">Settings</button>
+    <button id="btn-logout" type="button" class="ghost">Sign out</button>
+  </header>
+
+  <div class="workspace">
+    <aside class="nav">
+      <div class="nav-head">
+        <h2>Connections</h2>
+        <button id="btn-new-conn" type="button">New</button>
+      </div>
+      <label class="filter">
+        <span class="sr">Filter objects</span>
+        <input id="tree-filter" type="search" placeholder="Filter opened objects" autocomplete="off">
+      </label>
+      <div id="tree" class="tree" role="tree"></div>
+    </aside>
+
+    <main class="stage">
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab active" data-tab="worksheet" role="tab" aria-selected="true">Worksheet</button>
+        <button type="button" class="tab" data-tab="object" role="tab" aria-selected="false">Object</button>
+        <button type="button" class="tab" data-tab="sessions" role="tab" aria-selected="false">Sessions</button>
+        <button type="button" class="tab" data-tab="tablespaces" role="tab" aria-selected="false">Tablespaces</button>
+        <button type="button" class="tab" data-tab="runtime" role="tab" aria-selected="false">Runtime</button>
+      </div>
+
+      <section id="panel-worksheet" class="panel active" role="tabpanel">
+        <div class="toolbar">
+          <button id="btn-run" type="button" class="primary">Run</button>
+          <button id="btn-commit" type="button">Commit</button>
+          <button id="btn-rollback" type="button">Rollback</button>
+          <label class="check"><input id="autocommit" type="checkbox"> Autocommit</label>
+          <label class="rows">Page size <input id="max-rows" type="number" min="1" max="500" value="50"></label>
+          <button id="btn-library" type="button">Library</button>
+          <button id="btn-clear" type="button" class="ghost">Clear</button>
+          <span class="hint">Ctrl+Enter runs the selection, or the whole script. A line with only / ends a PL/SQL block.</span>
+        </div>
+        <textarea id="sql" spellcheck="false" aria-label="SQL worksheet" placeholder="SELECT USER FROM dual;"></textarea>
+        <label class="binds">
+          Binds
+          <input id="binds" type="text" spellcheck="false" placeholder='{"id": 10}' autocomplete="off">
+        </label>
+        <div id="sql-output" class="output" aria-live="polite"></div>
+      </section>
+
+      <section id="panel-object" class="panel" role="tabpanel" hidden>
+        <div id="object-view" class="output"></div>
+      </section>
+
+      <section id="panel-sessions" class="panel" role="tabpanel" hidden>
+        <div class="toolbar">
+          <button id="btn-sessions" type="button">Refresh</button>
+          <label class="check"><input id="sessions-refresh" type="checkbox"> Refresh every 15s</label>
+          <label class="rows">Status
+            <select id="session-status" aria-label="Filter sessions by status">
+              <option value="">All</option>
+              <option value="ACTIVE">Active</option>
+              <option value="INACTIVE">Inactive</option>
+              <option value="KILLED">Killed</option>
+              <option value="BLOCKED">Blocked</option>
+            </select>
+          </label>
+          <label class="rows">Filter
+            <input id="session-filter" type="search" placeholder="user, machine, SQL…" autocomplete="off">
+          </label>
+          <span id="session-count" class="fine"></span>
+        </div>
+        <div id="session-summary" class="cards"></div>
+        <p id="session-notice" class="banner" hidden></p>
+        <div id="session-table" class="scroll"></div>
+        <div id="session-detail"></div>
+      </section>
+
+      <section id="panel-tablespaces" class="panel" role="tabpanel" hidden>
+        <div class="toolbar">
+          <button id="btn-tablespaces" type="button">Refresh</button>
+          <label class="check"><input id="tablespaces-refresh" type="checkbox"> Refresh every 15s</label>
+          <label class="rows">Filter
+            <input id="ts-filter" type="search" placeholder="tablespace name" autocomplete="off">
+          </label>
+          <span id="ts-count" class="fine"></span>
+        </div>
+        <div id="ts-summary" class="cards"></div>
+        <p id="ts-notice" class="banner" hidden></p>
+        <div id="ts-table" class="scroll"></div>
+      </section>
+
+      <section id="panel-runtime" class="panel" role="tabpanel" hidden>
+        <div class="toolbar">
+          <button id="btn-runtime" type="button">Refresh</button>
+          <label class="check"><input id="runtime-refresh" type="checkbox"> Refresh every 15s</label>
+          <span id="runtime-connection" class="hint"></span>
+        </div>
+        <div id="runtime-body" class="scroll"></div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="statusbar">
+    <span id="status-text">Ready</span>
+    <span id="tx-text"></span>
+    <span class="spacer"></span>
+    <span>v{{ version }}</span>
+  </footer>
+  <div id="toast" class="toast" role="status"></div>
+
+  <dialog id="conn-dialog" aria-labelledby="conn-title">
+    <form id="conn-form" autocomplete="off">
+      <header class="dialog-head">
+        <h3 id="conn-title">Connection</h3>
+        <button type="button" id="conn-close" class="ghost" aria-label="Close">Close</button>
+      </header>
+      <div class="dialog-body">
+        <div class="grid-2">
+          <label>Name <input id="f-name" required maxlength="80"></label>
+          <label>Database user <input id="f-user" required maxlength="128" autocapitalize="off"></label>
+          <label>Password <input id="f-password" type="password" maxlength="1024" autocomplete="new-password"></label>
+          <label>Role
+            <select id="f-role">
+              <option value="">Default</option>
+              <option value="SYSDBA">SYSDBA</option>
+              <option value="SYSOPER">SYSOPER</option>
+            </select>
+          </label>
+        </div>
+        <label class="check"><input id="f-read-only" type="checkbox"> <span>Read only — SELECT and WITH only</span></label>
+        <fieldset class="mode-choices">
+          <legend>How to connect</legend>
+          <label class="choice">
+            <input type="radio" name="mode" value="classic" checked>
+            <span><strong>Classic</strong><small>Host, port, and service name or SID</small></span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="mode" value="wallet">
+            <span><strong>Autonomous wallet</strong><small>Wallet directory on this server and a TNS alias</small></span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="mode" value="connect_string">
+            <span><strong>JDBC URL or connect string</strong><small>jdbc:oracle:thin:@... or a DESCRIPTION block, including a wallet path</small></span>
+          </label>
+        </fieldset>
+        <div id="panel-classic" class="mode-panel active">
+          <div class="grid-2">
+            <label>Host <input id="f-host" placeholder="db.example.com"></label>
+            <label>Port <input id="f-port" type="number" min="1" max="65535" value="1521"></label>
+            <label>Service name <input id="f-service" placeholder="ORCLPDB1"></label>
+            <label>SID <input id="f-sid" placeholder="Leave empty if you use a service name"></label>
+            <label>Protocol
+              <select id="f-protocol">
+                <option value="tcp">TCP</option>
+                <option value="tcps">TCPS</option>
+              </select>
+            </label>
+          </div>
+          <p class="fine">Autonomous Database one-way TLS usually uses TCPS on port 1522. Use a wallet when the download includes cwallet.sso.</p>
+        </div>
+        <div id="panel-wallet" class="mode-panel">
+          <label>Wallet directory on this server <input id="f-wallet" placeholder="/var/lib/e1p-db-viewer/wallets/prod"></label>
+          <label>Wallet password <input id="f-wallet-password" type="password" autocomplete="new-password" placeholder="Required for ewallet.p12 without cwallet.sso"></label>
+          <label>TNS alias <input id="f-alias" placeholder="mydb_high"></label>
+          <p id="wallet-warning" class="fine">Unzip the Autonomous wallet on the server. The alias is a name in tnsnames.ora, often ending in _high, _medium, or _low.</p>
+        </div>
+        <div id="panel-connect_string" class="mode-panel">
+          <label>JDBC URL or connect string
+            <textarea id="f-dsn" rows="4" spellcheck="false" placeholder="jdbc:oracle:thin:@dbhost.example.com:1521/ORCLPDB1"></textarea>
+          </label>
+          <p class="fine">Also accepts host:port/service, host:port:SID, tcps://host:port/service, a (DESCRIPTION=...) block, and alias?TNS_ADMIN=/path/to/wallet.</p>
+        </div>
+        <label class="check"><input id="f-ssl" type="checkbox" checked> <span>Check the database certificate name for TCPS</span></label>
+        <p id="conn-form-note" class="form-note" role="status"></p>
+      </div>
+      <footer class="dialog-actions">
+        <button type="button" id="conn-test">Test</button>
+        <button type="submit" class="primary" id="conn-save">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <header class="dialog-head">
+      <h3 id="settings-title">Settings</h3>
+      <button type="button" id="settings-close" class="ghost" aria-label="Close">Close</button>
+    </header>
+    <div class="dialog-body">
+      <fieldset class="appearance">
+        <legend>Appearance</legend>
+        <div class="theme-grid">
+          <label class="choice"><input type="radio" name="theme" value="dark"><span><strong>Dark</strong><small>Dim slate</small></span></label>
+          <label class="choice"><input type="radio" name="theme" value="light"><span><strong>Light</strong><small>Bright paper</small></span></label>
+          <label class="choice"><input type="radio" name="theme" value="midnight"><span><strong>Midnight</strong><small>Indigo</small></span></label>
+          <label class="choice"><input type="radio" name="theme" value="harbor"><span><strong>Harbor</strong><small>Teal night</small></span></label>
+          <label class="choice"><input type="radio" name="theme" value="sand"><span><strong>Sand</strong><small>Warm daylight</small></span></label>
+          <label class="choice"><input type="radio" name="theme" value="contrast"><span><strong>Contrast</strong><small>Black and yellow</small></span></label>
+        </div>
+      </fieldset>
+      <p class="fine">This choice is saved in this browser only.</p>
+    </div>
+  </dialog>
+  <dialog id="library-dialog" aria-labelledby="library-title">
+    <header class="dialog-head">
+      <h3 id="library-title">Saved queries</h3>
+      <button type="button" id="library-close" class="ghost" aria-label="Close">Close</button>
+    </header>
+    <div class="dialog-body library">
+      <div>
+        <div class="nav-head">
+          <h2>Buckets</h2>
+          <button id="bucket-new" type="button">New</button>
+        </div>
+        <div id="bucket-list"></div>
+      </div>
+      <div>
+        <div class="nav-head">
+          <h2 id="bucket-title">Queries</h2>
+          <button id="query-save" type="button">Save worksheet</button>
+        </div>
+        <div id="query-list"></div>
+      </div>
+    </div>
+  </dialog>
+  <script src="/static/js/app.js?v=5"></script>
+</body>
+</html>

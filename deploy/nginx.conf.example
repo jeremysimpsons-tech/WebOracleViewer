@@ -1,0 +1,17 @@
+# Example TLS reverse proxy. Keep the app on 127.0.0.1 and set COOKIE_SECURE=true.
+server {
+    listen 443 ssl;
+    server_name dbviewer.example.internal;
+
+    ssl_certificate     /etc/pki/tls/certs/dbviewer.crt;
+    ssl_certificate_key /etc/pki/tls/private/dbviewer.key;
+
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
