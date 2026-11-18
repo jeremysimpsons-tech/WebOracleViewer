@@ -74,6 +74,13 @@ Ctrl+Enter runs the selected text, or the whole script when nothing is selected.
 - Bind variables use the **Binds** box as JSON, for example `{"id": 10}`. Names are matched without case sensitivity.
 - `DBMS_OUTPUT` is collected after the script when server output is on. It is on unless you send `SET SERVEROUTPUT OFF`.
 - Autocommit is off until you check it. **Commit** and **Rollback** act on the pinned session.
+- **Cancel** stops the statement that is running. It does not roll back. Uncommitted work stays open.
+- If a later statement fails, the whole script is rolled back. Turn that off under **Settings → Database client** when you need to keep the earlier statements.
+- **DROP**, **TRUNCATE**, **GRANT**, **REVOKE**, **CREATE**, **PURGE**, **FLASHBACK**, **RENAME**, and **ALTER** (except `ALTER SESSION`) ask you to confirm before they run.
+- A read-only connection refuses `SELECT … FOR UPDATE` and `LOCK TABLE` when **Block locking SQL** is on. That switch is on by default. A locking statement is not kept open for **Next**.
+- Uncommitted work is rolled back after 5 minutes with no activity. The database session stays open.
+- A result page closes after 2 minutes with no **Next**. Run the query again to read further rows.
+- Closing the browser tab disconnects the database sessions and rolls them back.
 - DDL still commits inside Oracle. That is Oracle’s behavior; the worksheet does not add an extra commit around a `SELECT`.
 - A `SELECT` or `WITH` query returns one page (default 50 rows, maximum 500). **Next** reads the following page from the same Oracle cursor. **Previous** shows pages already fetched in this browser. The viewer does not run `COUNT(*)` and does not load the rest of a large table. A new **Run**, a disconnect, or an idle timeout closes the open page.
 - If the last page is exactly full, **Next** may return an empty page. That means the result has ended.
@@ -89,19 +96,24 @@ Ctrl+Enter runs the selected text, or the whole script when nothing is selected.
 - Click a title to put that SQL back in the worksheet. **Replace** overwrites it with the current worksheet. **Delete** removes one query.
 - A bucket holds at most 100 queries, and the library holds at most 40 buckets.
 
-## Appearance
+## Database client safeguards
 
-**Settings**, and the sign-in page, offer Dark, Light, Midnight, Harbor, Sand, and Contrast. The choice stays in this browser as `e1p-theme`. The server does not store it.
+**Settings → Database client** stores these choices on the server, in `data/client-prefs.json`:
+
+- **Block locking SQL** (on). Read-only connections cannot run `SELECT … FOR UPDATE` or `LOCK TABLE`. Locking statements read one page and close the cursor.
+- **Roll back the script if a statement fails** (on). **Cancel** does not use this path.
+- **Open connections** (5). Each open saved connection is one Oracle session.
+- **Tag sessions** (on). `V$SESSION.ACTION` is Worksheet, Data, Sessions, Tablespaces, or Runtime. The next **Connect** also sends a keepalive every 2 minutes so Oracle can drop a client whose network died. Turn the switch off and **Connect** again to stop that keepalive.
+
+These are always on: uncommitted work rolls back after 5 idle minutes while the session stays up, an unused result page closes after 2 minutes, and closing the browser tab disconnects and rolls back. A database session with no activity for `DB_SESSION_IDLE_SECONDS` (default 30 minutes) is still closed entirely.
 
 The mark at the top left is the application icon. The name beside it is E1P DB Viewer.
 
-An idle pinned session is rolled back and closed after `DB_SESSION_IDLE_SECONDS` (default 30 minutes).
-
 ## Sessions
 
-The Sessions tab reads `V$SESSION` for user sessions and, when granted, the current and previous SQL text from `V$SQL`. Summary cards count total, active, inactive, and blocked sessions. A row with `blocking_session` set is highlighted. The working connection’s own session is marked.
+The Sessions tab reads `V$SESSION` for user sessions. Summary cards count total, active, inactive, and blocked sessions. A row with `blocking_session` set is highlighted. The working connection’s own session is marked. Statement text is read from `V$SQL` only for the row you click, including during the 15-second refresh.
 
-The grid shows SID, serial, user, status, OS user, machine, program, module, action, SQL id, the running SQL, wait event, blocking session, last call, and logon time. Click a row for the rest: schema, server, service, consumer group, container, terminal, port, process, client info, client identifier, SQL start, previous SQL, wait class, and blocking status.
+The grid shows SID, serial, user, status, OS user, machine, program, module, action, SQL id, wait event, blocking session, last call, and logon time. Click a row for the rest: schema, server, service, consumer group, container, terminal, port, process, client info, client identifier, the current SQL, the previous SQL, and wait details.
 
 **Filter** matches any of those values, including SQL text that is not on the main grid. **Status** limits the list to Active, Inactive, Killed, or Blocked. Click a column heading to sort. Click it again to reverse the sort. Filter and sort stay in place while the 15-second refresh runs.
 

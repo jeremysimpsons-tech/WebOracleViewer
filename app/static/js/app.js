@@ -31,6 +31,19 @@ const TYPES = [
 
 document.addEventListener("DOMContentLoaded", () => {
   bindChrome();
+  window.addEventListener("pagehide", (event) => {
+    if (event.persisted || !state.csrf) return;
+    fetch("/api/connections/close-browser", {
+      method: "POST",
+      credentials: "same-origin",
+      keepalive: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": state.csrf,
+      },
+      body: "{}",
+    });
+  });
   refreshAll().catch((error) => toast(error.message, "error"));
 });
 
@@ -38,7 +51,9 @@ function bindChrome() {
   document.getElementById("btn-logout").addEventListener("click", logout);
   document.getElementById("btn-settings").addEventListener("click", () => {
     document.getElementById("settings-dialog").showModal();
+    loadClientPrefs();
   });
+  document.getElementById("pref-save").addEventListener("click", saveClientPrefs);
   document.getElementById("settings-close").addEventListener("click", () => {
     document.getElementById("settings-dialog").close();
   });
@@ -56,7 +71,8 @@ function bindChrome() {
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => showTab(button.dataset.tab));
   });
-  document.getElementById("btn-run").addEventListener("click", runSql);
+  document.getElementById("btn-run").addEventListener("click", () => runSql(false));
+  document.getElementById("btn-cancel").addEventListener("click", cancelSql);
   document.getElementById("btn-library").addEventListener("click", openLibrary);
   document.getElementById("library-close").addEventListener("click", () => {
     document.getElementById("library-dialog").close();
@@ -124,6 +140,9 @@ async function refreshAll() {
   }
   renderTree();
   paintStatus();
+  if (state.workspace && state.workspace.idle_rollback_note) {
+    toast(state.workspace.idle_rollback_note);
+  }
 }
 
 async function api(method, url, body) {
@@ -675,7 +694,49 @@ function setFormNote(message, kind) {
   note.className = "form-note" + (kind ? " " + kind : "");
 }
 
-async function runSql() {
+async function cancelSql() {
+  try {
+    const data = await api("POST", "/api/sql/cancel", {});
+    toast(data.message || "Cancel sent.");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function loadClientPrefs() {
+  const note = document.getElementById("pref-note");
+  note.textContent = "";
+  note.className = "form-note";
+  try {
+    const prefs = await api("GET", "/api/client-prefs");
+    document.getElementById("pref-locking").checked = !!prefs.block_locking_sql;
+    document.getElementById("pref-rollback").checked = !!prefs.rollback_script_on_error;
+    document.getElementById("pref-max-open").value = prefs.max_open_connections;
+    document.getElementById("pref-tag").checked = !!prefs.tag_sessions;
+  } catch (error) {
+    note.className = "form-note bad";
+    note.textContent = error.message;
+  }
+}
+
+async function saveClientPrefs() {
+  const note = document.getElementById("pref-note");
+  try {
+    await api("PUT", "/api/client-prefs", {
+      block_locking_sql: document.getElementById("pref-locking").checked,
+      rollback_script_on_error: document.getElementById("pref-rollback").checked,
+      max_open_connections: Number(document.getElementById("pref-max-open").value),
+      tag_sessions: document.getElementById("pref-tag").checked,
+    });
+    note.className = "form-note ok";
+    note.textContent = "Saved.";
+  } catch (error) {
+    note.className = "form-note bad";
+    note.textContent = error.message;
+  }
+}
+
+async function runSql(confirmDdl) {
   const editor = document.getElementById("sql");
   const selected = editor.value.slice(editor.selectionStart, editor.selectionEnd);
   const sql = selected.trim() ? selected : editor.value;
@@ -698,7 +759,10 @@ async function runSql() {
     }
   }
   const button = document.getElementById("btn-run");
+  const cancel = document.getElementById("btn-cancel");
+  let handedOff = false;
   button.disabled = true;
+  cancel.disabled = false;
   setStatus("Running…");
   try {
     const data = await api("POST", "/api/sql/execute", {
@@ -706,16 +770,28 @@ async function runSql() {
       max_rows: Number(document.getElementById("max-rows").value || 50),
       autocommit: document.getElementById("autocommit").checked,
       binds,
+      confirm_ddl: !!confirmDdl,
     });
     renderSql(data);
     if (state.workspace) state.workspace.open_transaction = !!data.open_transaction;
     paintStatus();
-    setStatus(data.ok ? "Completed" : "Stopped with an error");
+    setStatus(data.rolled_back ? "Rolled back after an error" : data.ok ? "Completed" : "Stopped with an error");
   } catch (error) {
+    if (error.data && error.data.code === "confirm_ddl" && !confirmDdl) {
+      if (window.confirm(error.message)) {
+        handedOff = true;
+        return runSql(true);
+      }
+      setStatus("Not run");
+      return;
+    }
     toast(error.message, "error");
     setStatus(error.message);
   } finally {
-    button.disabled = false;
+    if (!handedOff) {
+      button.disabled = false;
+      cancel.disabled = true;
+    }
   }
 }
 
@@ -747,8 +823,13 @@ function renderSql(data) {
   if (data.error && data.error.message) {
     output.appendChild(problemBox(data.error.message));
   }
-  if (data.open_transaction) {
+  if (data.rolled_back) {
+    output.appendChild(el("p", { class: "banner" }, "The script failed, so this session was rolled back."));
+  } else if (data.open_transaction) {
     output.appendChild(el("p", { class: "banner" }, "A transaction is open. Commit or roll it back."));
+  }
+  if ((data.results || []).some((result) => result.paging_closed)) {
+    output.appendChild(el("p", { class: "fine" }, "A locking statement was not kept open. Only this page was read, and its cursor was closed."));
   }
 }
 
@@ -902,8 +983,11 @@ function paintSessionDetail(data, row) {
     const present = keys.filter((key) => Object.prototype.hasOwnProperty.call(row, key));
     const block = el("section", { class: title.indexOf("SQL") >= 0 ? "wide" : "" });
     block.appendChild(el("h4", {}, title));
-    if (title === "Current SQL" && !Object.prototype.hasOwnProperty.call(row, "sql_text")) {
-      block.appendChild(el("p", { class: "fine" }, "Statement text is not in this result. Grant SELECT on V_$SQL to read it."));
+    if (title === "Current SQL" && row.sql_notice) {
+      block.appendChild(el("p", { class: "fine" }, row.sql_notice));
+    }
+    if (title === "Current SQL" && !Object.prototype.hasOwnProperty.call(row, "sql_text") && !row.sql_notice) {
+      block.appendChild(el("p", { class: "fine" }, "Loading statement text…"));
     }
     if (!present.length) {
       block.appendChild(el("p", { class: "fine" }, "No columns in this group."));
@@ -928,6 +1012,36 @@ function paintSessionDetail(data, row) {
     }
     host.appendChild(block);
   });
+  if (row.serial !== undefined && row.serial !== null && row.serial !== "" && !Object.prototype.hasOwnProperty.call(row, "sql_text")) {
+    loadSessionSql(row);
+  }
+}
+
+async function loadSessionSql(row) {
+  const key = sessionKey(row);
+  try {
+    const extra = await api(
+      "GET",
+      "/api/monitor/sessions/sql?sid=" + encodeURIComponent(row.sid) + "&serial=" + encodeURIComponent(row.serial)
+    );
+    if (state.sessionFocus !== key || !state.sessionReport) return;
+    const current = (state.sessionReport.rows || []).find((item) => sessionKey(item) === key);
+    if (!current) return;
+    current.sql_text = extra.sql_text === undefined ? null : extra.sql_text;
+    current.prev_sql_text = extra.prev_sql_text === undefined ? null : extra.prev_sql_text;
+    ["sql_id", "prev_sql_id", "sql_exec_start", "prev_exec_start", "sql_child_number", "prev_child_number"].forEach((field) => {
+      if (extra[field] !== undefined && extra[field] !== null) current[field] = extra[field];
+    });
+    current.sql_notice = extra.notice || "";
+    paintSessionDetail(state.sessionReport, current);
+  } catch (error) {
+    if (state.sessionFocus !== key || !state.sessionReport) return;
+    const current = (state.sessionReport.rows || []).find((item) => sessionKey(item) === key);
+    if (!current || Object.prototype.hasOwnProperty.call(current, "sql_text")) return;
+    current.sql_text = null;
+    current.sql_notice = error.message;
+    paintSessionDetail(state.sessionReport, current);
+  }
 }
 
 function sessionKillButton(data, row) {

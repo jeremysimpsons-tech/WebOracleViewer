@@ -20,11 +20,12 @@ def test_sessions_fall_back_and_keep_the_oracle_error():
     assert report["summary"]["active"] == 1
 
 
-def test_sql_text_failure_keeps_session_client_and_wait_columns():
+def test_session_list_does_not_query_sql_text_for_every_row():
+    seen = []
+
     def fetch(sql: str):
+        seen.append(sql)
         lowered = sql.lower()
-        if "v$sql" in lowered:
-            raise QueryFailed("ORA-00942: table or view does not exist")
         if "from v$session" in lowered and "module" in lowered:
             return [{
                 "sid": 8,
@@ -42,11 +43,10 @@ def test_sql_text_failure_keeps_session_client_and_wait_columns():
 
     report = build_sessions(fetch)
     assert report["source"] == "v$session"
+    assert report["notice"] is None
     assert report["rows"][0]["program"] == "sqlplus"
-    assert "V_$SQL" in report["notice"]
     assert report["current_sid"] == 8
-    assert report["current_serial"] == 4
-    assert report["summary"]["blocked"] == 1
+    assert all("v$sql" not in sql.lower() for sql in seen)
 
 
 def test_kill_session_statement_uses_integers_only():

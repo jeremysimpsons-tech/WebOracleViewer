@@ -7,7 +7,7 @@
   <meta name="robots" content="noindex, nofollow">
   <title>E1P DB Viewer</title>
   <link rel="icon" href="/static/favicon.svg?v=4" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <link rel="stylesheet" href="/static/css/app.css?v=6">
   <script src="/static/js/theme.js?v=4"></script>
 </head>
 <body>
@@ -51,6 +51,7 @@
       <section id="panel-worksheet" class="panel active" role="tabpanel">
         <div class="toolbar">
           <button id="btn-run" type="button" class="primary">Run</button>
+          <button id="btn-cancel" type="button" disabled>Cancel</button>
           <button id="btn-commit" type="button">Commit</button>
           <button id="btn-rollback" type="button">Rollback</button>
           <label class="check"><input id="autocommit" type="checkbox"> Autocommit</label>
@@ -217,7 +218,20 @@
           <label class="choice"><input type="radio" name="theme" value="contrast"><span><strong>Contrast</strong><small>Black and yellow</small></span></label>
         </div>
       </fieldset>
-      <p class="fine">This choice is saved in this browser only.</p>
+      <p class="fine">Appearance is saved in this browser only.</p>
+      <fieldset class="appearance">
+        <legend>Database client</legend>
+        <label class="check"><input id="pref-locking" type="checkbox"> Block locking SQL on read-only connections</label>
+        <p class="fine">SELECT FOR UPDATE and LOCK TABLE are refused on a read-only connection. Locking statements are not kept open for Next.</p>
+        <label class="check"><input id="pref-rollback" type="checkbox"> Roll back the script if a statement fails</label>
+        <p class="fine">Cancel does not roll back. Uncommitted work stays open so you can commit or roll it back.</p>
+        <label class="rows">Open connections <input id="pref-max-open" type="number" min="1" max="30" value="5"></label>
+        <label class="check"><input id="pref-tag" type="checkbox"> Tag sessions and detect a dead network</label>
+        <p class="fine">V$SESSION.ACTION shows the tool in use. A new connection sends a keepalive every 2 minutes. Turn this off, then Connect again, to stop the keepalive.</p>
+        <button id="pref-save" type="button">Save client settings</button>
+        <p id="pref-note" class="form-note" role="status"></p>
+      </fieldset>
+      <p class="fine">Uncommitted work is rolled back after 5 minutes with no activity. The database session stays open. A result page closes after 2 minutes with no Next. Closing this tab disconnects the database sessions.</p>
     </div>
   </dialog>
   <dialog id="library-dialog" aria-labelledby="library-title">
@@ -242,6 +256,6 @@
       </div>
     </div>
   </dialog>
-  <script src="/static/js/app.js?v=5"></script>
+  <script src="/static/js/app.js?v=6"></script>
 </body>
 </html>

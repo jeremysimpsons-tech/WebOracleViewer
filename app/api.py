@@ -6,14 +6,14 @@ import logging
 from typing import Any, Literal
 
 import oracledb
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.audit import audit
 from app.catalog import browse_rows, describe_object, list_objects, list_owners
-from app.db import connection_lost, describe_session, fetch_dicts
+from app.db import EXPIRE_TIME_MINUTES, connection_lost, describe_session, fetch_dicts
 from app.errors import AppError, QueryFailed, first_line
-from app.monitor import build_runtime, build_sessions, build_tablespaces, kill_session_sql
+from app.monitor import build_runtime, build_session_sql, build_sessions, build_tablespaces, kill_session_sql
 from app.security import check_csrf, client_ip, rotate_session, verify_admin_password
 from app.worksheet import execute_script, fetch_next_page
 
@@ -73,6 +73,15 @@ class ExecuteIn(BaseModel):
     max_rows: int = Field(default=50, ge=1, le=500)
     autocommit: bool = False
     binds: dict[str, Any] | None = None
+    confirm_ddl: bool = False
+
+
+class PrefsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    block_locking_sql: bool
+    rollback_script_on_error: bool
+    max_open_connections: int = Field(ge=1, le=30)
+    tag_sessions: bool
 
 
 class PageIn(BaseModel):
@@ -89,6 +98,12 @@ class QueryIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str
     sql: str = ""
+
+
+def _action(request: Request, name: str) -> str | None:
+    if request.app.state.prefs.get()["tag_sessions"]:
+        return name
+    return None
 
 
 def _user(request: Request) -> str:
@@ -144,10 +159,23 @@ def workspace(request: Request) -> dict:
         "service_name": handle.service_name if handle else None,
         "read_only": handle.read_only if handle else False,
         "open_transaction": handle.open_transaction if handle else False,
+        "idle_rollback_note": registry.take_idle_note(sid),
         "open_connections": opened,
         "wallet_root": str(settings.wallet_root) if settings.wallet_root else None,
         "max_fetch_rows": settings.max_fetch_rows,
     }
+
+
+@router.get("/api/client-prefs")
+def client_prefs(request: Request) -> dict:
+    _user(request)
+    return request.app.state.prefs.get()
+
+
+@router.put("/api/client-prefs")
+def update_client_prefs(body: PrefsIn, request: Request) -> dict:
+    _mutate(request)
+    return request.app.state.prefs.update(body.model_dump())
 
 
 @router.get("/api/connections")
@@ -236,7 +264,15 @@ def connect(connection_id: str, body: ConfirmIn, request: Request) -> dict:
     store = request.app.state.store
     record = store.get(connection_id)
     secrets = store.secrets_for(record)
-    handle, rolled = request.app.state.registry.connect(sid, record, secrets, body.confirm_rollback)
+    prefs = request.app.state.prefs.get()
+    handle, rolled = request.app.state.registry.connect(
+        sid,
+        record,
+        secrets,
+        body.confirm_rollback,
+        max_open=prefs["max_open_connections"],
+        expire_time=EXPIRE_TIME_MINUTES if prefs["tag_sessions"] else None,
+    )
     request.session["active_connection_id"] = connection_id
     audit(
         request.app.state.settings,
@@ -293,7 +329,7 @@ def disconnect(body: ConfirmIn, request: Request) -> dict:
 @router.get("/api/schema/owners")
 def owners(request: Request) -> dict:
     sid = _user(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Data")) as handle:
         try:
             return list_owners(handle.conn)
         except AppError as exc:
@@ -305,7 +341,7 @@ def owners(request: Request) -> dict:
 @router.get("/api/schema/objects")
 def objects(request: Request, owner: str, type: str, q: str = "") -> dict:
     sid = _user(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Data")) as handle:
         try:
             return list_objects(handle.conn, owner, type, q)
         except AppError as exc:
@@ -317,7 +353,7 @@ def objects(request: Request, owner: str, type: str, q: str = "") -> dict:
 @router.get("/api/schema/object")
 def object_detail(request: Request, owner: str, name: str, type: str) -> dict:
     sid = _user(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Data")) as handle:
         try:
             return describe_object(handle.conn, owner, name, type)
         except AppError as exc:
@@ -330,7 +366,7 @@ def object_detail(request: Request, owner: str, name: str, type: str) -> dict:
 def schema_rows(body: RowsIn, request: Request) -> dict:
     sid = _mutate(request)
     limit = min(body.limit, request.app.state.settings.max_fetch_rows)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Data")) as handle:
         try:
             return browse_rows(
                 handle.conn,
@@ -353,7 +389,8 @@ def execute(body: ExecuteIn, request: Request) -> dict:
     sid = _mutate(request)
     settings = request.app.state.settings
     registry = request.app.state.registry
-    with registry.session(sid) as handle:
+    prefs = request.app.state.prefs.get()
+    with registry.session(sid, _action(request, "Worksheet")) as handle:
         record = request.app.state.store.get(handle.connection_id)
         secrets = request.app.state.store.secrets_for(record)
         secret_values = [secrets["password"], secrets["wallet_password"]]
@@ -366,6 +403,9 @@ def execute(body: ExecuteIn, request: Request) -> dict:
                 body.autocommit,
                 body.binds,
                 secret_values,
+                confirm_ddl=body.confirm_ddl,
+                block_locking_sql=prefs["block_locking_sql"],
+                rollback_script_on_error=prefs["rollback_script_on_error"],
             )
         except oracledb.Error as exc:
             if connection_lost(exc):
@@ -401,7 +441,7 @@ def execute(body: ExecuteIn, request: Request) -> dict:
 @router.post("/api/sql/page")
 def sql_page(body: PageIn, request: Request) -> dict:
     sid = _mutate(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Worksheet")) as handle:
         try:
             page = fetch_next_page(handle, body.token)
         except oracledb.Error as exc:
@@ -457,7 +497,7 @@ def library_delete_query(query_id: str, request: Request) -> dict:
 @router.post("/api/sql/commit")
 def commit(request: Request) -> dict:
     sid = _mutate(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Worksheet")) as handle:
         if handle.read_only:
             raise AppError("This connection is read only. Commit is blocked.", 403)
         try:
@@ -471,7 +511,7 @@ def commit(request: Request) -> dict:
 @router.post("/api/sql/rollback")
 def rollback(request: Request) -> dict:
     sid = _mutate(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Worksheet")) as handle:
         try:
             handle.conn.rollback()
         except oracledb.Error as exc:
@@ -482,7 +522,7 @@ def rollback(request: Request) -> dict:
 
 @router.get("/api/monitor/sessions")
 def sessions(request: Request) -> dict:
-    return _monitor(request, build_sessions, "Sessions")
+    return _monitor(request, build_sessions, "Sessions", "Sessions")
 
 
 class KillSessionIn(BaseModel):
@@ -495,7 +535,7 @@ class KillSessionIn(BaseModel):
 def kill_session(body: KillSessionIn, request: Request) -> dict:
     sid = _mutate(request)
     statement = kill_session_sql(body.sid, body.serial)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, "Sessions")) as handle:
         if handle.read_only:
             raise AppError("This connection is read only. Kill session is blocked.", 403)
         try:
@@ -522,17 +562,58 @@ def kill_session(body: KillSessionIn, request: Request) -> dict:
 
 @router.get("/api/monitor/tablespaces")
 def tablespaces(request: Request) -> dict:
-    return _monitor(request, build_tablespaces, "Tablespaces")
+    return _monitor(request, build_tablespaces, "Tablespaces", "Tablespaces")
 
 
 @router.get("/api/monitor/runtime")
 def runtime(request: Request) -> dict:
-    return _monitor(request, build_runtime, "Runtime dashboard")
+    return _monitor(request, build_runtime, "Runtime dashboard", "Runtime")
 
 
-def _monitor(request: Request, builder, tool: str) -> dict:
+@router.get("/api/monitor/sessions/sql")
+def session_sql(
+    request: Request,
+    sid: int = Query(ge=1, le=999_999_999),
+    serial: int = Query(ge=1, le=999_999_999),
+) -> dict:
+    browser = _user(request)
+
+    def run(fetch_binds):
+        return build_session_sql(fetch_binds, sid, serial)
+
+    with request.app.state.registry.session(browser, _action(request, "Sessions")) as handle:
+        def fetch_binds(sql: str, binds: dict) -> list[dict]:
+            return fetch_dicts(handle.conn, sql, binds)
+
+        try:
+            report = run(fetch_binds)
+        except QueryFailed as exc:
+            raise AppError(
+                f"Session SQL on {handle.name} ({handle.db_user}): {first_line(exc.message)}",
+                400,
+            ) from exc
+        except oracledb.Error as exc:
+            _raise_oracle(request, browser, exc, "Session SQL")
+        return report
+
+
+@router.post("/api/sql/cancel")
+def cancel_sql(request: Request) -> dict:
+    sid = _mutate(request)
+    request.app.state.registry.cancel(sid)
+    return {"ok": True, "message": "Cancel sent. Uncommitted work is still open."}
+
+
+@router.post("/api/connections/close-browser")
+def close_browser(request: Request) -> dict:
+    sid = _mutate(request)
+    request.app.state.registry.close_browser(sid)
+    return {"ok": True}
+
+
+def _monitor(request: Request, builder, tool: str, action: str) -> dict:
     sid = _user(request)
-    with request.app.state.registry.session(sid) as handle:
+    with request.app.state.registry.session(sid, _action(request, action)) as handle:
         def fetch(sql: str) -> list[dict]:
             return fetch_dicts(handle.conn, sql)
 

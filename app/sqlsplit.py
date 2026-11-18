@@ -333,6 +333,75 @@ def _peek_word(sql: str, index: int) -> str:
     return sql[cursor:end].upper()
 
 
+def is_locking_sql(sql: str) -> bool:
+    """True for LOCK TABLE and SELECT/WITH ... FOR UPDATE."""
+    words = _sql_words(sql)
+    if not words:
+        return False
+    if words[0] == "LOCK":
+        return True
+    if words[0] not in {"SELECT", "WITH"}:
+        return False
+    return any(word == "FOR" and index + 1 < len(words) and words[index + 1] == "UPDATE" for index, word in enumerate(words))
+
+
+def needs_ddl_confirm(sql: str) -> bool:
+    """True for statements that can change or remove database objects.
+
+    ALTER SESSION is left out. It changes the current session only.
+    """
+    words = _sql_words(sql)
+    if not words:
+        return False
+    if words[0] in {"DROP", "TRUNCATE", "GRANT", "REVOKE", "CREATE", "PURGE", "FLASHBACK", "RENAME"}:
+        return True
+    if words[0] == "ALTER":
+        return not (len(words) > 1 and words[1] == "SESSION")
+    return False
+
+
+def _sql_words(sql: str) -> list[str]:
+    words: list[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "'":
+            index += 1
+            while index < length:
+                if sql[index] == "'" and index + 1 < length and sql[index + 1] == "'":
+                    index += 2
+                    continue
+                if sql[index] == "'":
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == '"':
+            index += 1
+            while index < length and sql[index] != '"':
+                index += 1
+            index = min(index + 1, length)
+            continue
+        if char == "-" and index + 1 < length and sql[index + 1] == "-":
+            newline = sql.find("\n", index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char == "/" and index + 1 < length and sql[index + 1] == "*":
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if _is_word_char(char):
+            end = index + 1
+            while end < length and _is_word_char(sql[end]):
+                end += 1
+            words.append(sql[index:end].upper())
+            index = end
+            continue
+        index += 1
+    return words
+
+
 def _end_of_next_word(sql: str, index: int) -> int:
     cursor = _skip_ws_and_comments(sql, index)
     if cursor >= len(sql) or not _is_word_char(sql[cursor]):

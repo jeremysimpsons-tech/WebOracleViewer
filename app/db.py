@@ -69,7 +69,17 @@ def fetch_dicts(connection: oracledb.Connection, sql: str, binds: dict | None = 
         cursor.close()
 
 
-def open_connection(record: dict, secrets: dict, settings: Settings) -> oracledb.Connection:
+TRANSACTION_IDLE_SECONDS = 300
+PAGE_CURSOR_IDLE_SECONDS = 120
+EXPIRE_TIME_MINUTES = 2
+
+
+def open_connection(
+    record: dict,
+    secrets: dict,
+    settings: Settings,
+    expire_time: int | None = None,
+) -> oracledb.Connection:
     password = secrets.get("password") or ""
     wallet_password = secrets.get("wallet_password") or ""
     kwargs: dict = {
@@ -79,6 +89,8 @@ def open_connection(record: dict, secrets: dict, settings: Settings) -> oracledb
         "retry_count": 0,
         "program": "e1p-viewer",
     }
+    if expire_time:
+        kwargs["expire_time"] = int(expire_time)
     role = (record.get("role") or "").upper()
     if role == "SYSDBA":
         kwargs["mode"] = oracledb.AUTH_MODE_SYSDBA
@@ -216,6 +228,7 @@ class DbHandle:
     db_name: str
     service_name: str
     page_cursors: dict = field(default_factory=dict)
+    idle_rollback_note: str = ""
 
     @property
     def open_transaction(self) -> bool:
@@ -258,23 +271,72 @@ class SessionRegistry:
             self.reap_idle()
 
     def reap_idle(self) -> None:
-        deadline = time.time() - self.settings.db_session_idle_seconds
-        stale: list[DbHandle] = []
+        now = time.time()
+        session_deadline = now - self.settings.db_session_idle_seconds
+        transaction_deadline = now - TRANSACTION_IDLE_SECONDS
+        page_deadline = now - PAGE_CURSOR_IDLE_SECONDS
+        closing: list[DbHandle] = []
         with self._lock:
             for key, handle in list(self._handles.items()):
-                if handle.last_used >= deadline:
-                    continue
                 if not handle.lock.acquire(blocking=False):
                     continue
-                self._handles.pop(key, None)
-                if self._active.get(handle.sid) == handle.connection_id:
-                    self._active.pop(handle.sid, None)
-                stale.append(handle)
-        for handle in stale:
+                if handle.last_used < session_deadline:
+                    self._handles.pop(key, None)
+                    if self._active.get(handle.sid) == handle.connection_id:
+                        self._active.pop(handle.sid, None)
+                    closing.append(handle)
+                    continue
+                self._maintain(handle, transaction_deadline, page_deadline)
+                handle.lock.release()
+        for handle in closing:
             try:
                 self._close(handle, rollback=True)
             finally:
                 handle.lock.release()
+
+    def _maintain(self, handle: DbHandle, transaction_deadline: float, page_deadline: float) -> None:
+        if handle.open_transaction and handle.last_used < transaction_deadline:
+            try:
+                handle.conn.rollback()
+                handle.idle_rollback_note = (
+                    "Uncommitted work was rolled back after 5 minutes with no activity. "
+                    "The database session stayed open."
+                )
+            except oracledb.Error:
+                log.warning("idle rollback failed name=%s", handle.name)
+        stale = [
+            token
+            for token, slot in handle.page_cursors.items()
+            if float(slot.get("touched") or 0) < page_deadline
+        ]
+        for token in stale:
+            slot = handle.page_cursors.pop(token, None)
+            if slot is None:
+                continue
+            try:
+                slot["cursor"].close()
+            except Exception:
+                pass
+
+    def cancel(self, sid: str) -> None:
+        handle = self.get(sid)
+        if handle is None:
+            raise AppError(
+                "Connect a database session first. Use Connect on a saved connection.",
+                409,
+            )
+        try:
+            handle.conn.cancel()
+        except oracledb.Error as exc:
+            raise AppError("The running statement could not be cancelled. " + first_line(str(exc))) from exc
+
+    def take_idle_note(self, sid: str) -> str:
+        handle = self.get(sid)
+        if handle is None or not handle.idle_rollback_note:
+            return ""
+        note = handle.idle_rollback_note
+        handle.idle_rollback_note = ""
+        return note
 
     def get(self, sid: str) -> DbHandle | None:
         with self._lock:
@@ -305,7 +367,7 @@ class SessionRegistry:
         return rows
 
     @contextmanager
-    def session(self, sid: str):
+    def session(self, sid: str, action: str | None = None):
         handle = self.get(sid)
         if handle is None:
             raise AppError(
@@ -321,12 +383,25 @@ class SessionRegistry:
             )
         try:
             handle.last_used = time.time()
+            if action:
+                try:
+                    handle.conn.action = action[:32]
+                except oracledb.Error:
+                    pass
             yield handle
             handle.last_used = time.time()
         finally:
             handle.lock.release()
 
-    def connect(self, sid: str, record: dict, secrets: dict, confirm: bool) -> tuple[DbHandle, bool]:
+    def connect(
+        self,
+        sid: str,
+        record: dict,
+        secrets: dict,
+        confirm: bool,
+        max_open: int = 5,
+        expire_time: int | None = None,
+    ) -> tuple[DbHandle, bool]:
         lock = self._sid_lock(sid)
         with lock:
             existing = self._find(sid, record["id"])
@@ -339,7 +414,21 @@ class SessionRegistry:
                 with self._lock:
                     self._active[sid] = record["id"]
                 return existing, False
-            connection = open_connection(record, secrets, self.settings)
+            with self._lock:
+                open_count = sum(1 for key in self._handles if key[0] == sid)
+            if open_count >= max_open:
+                raise AppError(
+                    f"This browser already has {open_count} database sessions open. "
+                    f"The limit is {max_open}. Disconnect one before opening another. "
+                    "Change the limit in Settings.",
+                    409,
+                )
+            connection = open_connection(record, secrets, self.settings, expire_time=expire_time)
+            if expire_time:
+                try:
+                    connection.action = "Connected"
+                except oracledb.Error:
+                    pass
             try:
                 info = describe_session(connection)
             except Exception:

@@ -48,62 +48,10 @@ SELECT s.sid AS "sid",
        s.seconds_in_wait AS "seconds_in_wait",
        s.blocking_session AS "blocking_session",
        s.blocking_session_status AS "blocking_session_status",
-       s.final_blocking_session AS "final_blocking_session",
-       (
-           SELECT SUBSTR(q.sql_text, 1, 4000)
-           FROM v$sql q
-           WHERE q.sql_id = s.sql_id
-             AND q.child_number = s.sql_child_number
-             AND ROWNUM = 1
-       ) AS "sql_text",
-       (
-           SELECT SUBSTR(q.sql_text, 1, 4000)
-           FROM v$sql q
-           WHERE q.sql_id = s.prev_sql_id
-             AND q.child_number = s.prev_child_number
-             AND ROWNUM = 1
-       ) AS "prev_sql_text"
+       s.final_blocking_session AS "final_blocking_session"
 FROM v$session s
 WHERE s.type = 'USER'
 ORDER BY s.status, s.username, s.sid
-"""
-
-_SESSIONS_NO_SQL = """
-SELECT sid AS "sid",
-       serial# AS "serial",
-       username AS "username",
-       status AS "status",
-       schemaname AS "schema_name",
-       osuser AS "osuser",
-       machine AS "machine",
-       terminal AS "terminal",
-       program AS "program",
-       module AS "module",
-       action AS "action",
-       client_info AS "client_info",
-       client_identifier AS "client_identifier",
-       process AS "process",
-       port AS "port",
-       type AS "session_type",
-       server AS "server",
-       service_name AS "service_name",
-       resource_consumer_group AS "consumer_group",
-       TO_CHAR(logon_time, 'YYYY-MM-DD HH24:MI:SS') AS "logon_time",
-       last_call_et AS "last_call_et",
-       sql_id AS "sql_id",
-       sql_child_number AS "sql_child_number",
-       TO_CHAR(sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS "sql_exec_start",
-       prev_sql_id AS "prev_sql_id",
-       event AS "event",
-       wait_class AS "wait_class",
-       state AS "state",
-       seconds_in_wait AS "seconds_in_wait",
-       blocking_session AS "blocking_session",
-       blocking_session_status AS "blocking_session_status",
-       final_blocking_session AS "final_blocking_session"
-FROM v$session
-WHERE type = 'USER'
-ORDER BY status, username, sid
 """
 
 _SESSIONS_SHORT = """
@@ -198,7 +146,6 @@ def build_sessions(fetch: Fetcher) -> dict:
     errors: list[str] = []
     for sql, kind in (
         (_SESSIONS, "full"),
-        (_SESSIONS_NO_SQL, "session"),
         (_SESSIONS_SHORT, "short"),
     ):
         try:
@@ -209,13 +156,7 @@ def build_sessions(fetch: Fetcher) -> dict:
             errors.append(first_line(exc.message))
             rows = None
             continue
-        if kind == "session":
-            notice = (
-                "SQL text was not read (" + " ".join(errors) + "). "
-                "Session, client, and wait columns come from V$SESSION. "
-                "Grant SELECT on V_$SQL to see the current and previous statement text."
-            )
-        elif kind == "short":
+        if kind == "short":
             notice = (
                 "Showing a shorter session list (" + " ".join(errors) + ")."
             )
@@ -248,6 +189,68 @@ def build_sessions(fetch: Fetcher) -> dict:
         "current_sid": current_sid,
         "current_serial": current_serial,
     }
+
+
+def build_session_sql(fetch_binds, sid: int, serial: int) -> dict:
+    """Read the current and previous SQL for one session. The list view does not."""
+    binds = {"sid": sid, "serial": serial}
+    try:
+        rows = fetch_binds(_SESSION_SQL, binds)
+    except QueryFailed as exc:
+        if not is_missing_privilege(exc.message):
+            raise
+        try:
+            rows = fetch_binds(_SESSION_SQL_IDS, binds)
+        except QueryFailed as second:
+            raise second
+        return {
+            "found": bool(rows),
+            "notice": (
+                "Statement text was not read (" + first_line(exc.message) + "). "
+                "Grant SELECT on V_$SQL. The SQL id from V$SESSION is shown when it is available."
+            ),
+            **(rows[0] if rows else {}),
+        }
+    if not rows:
+        return {"found": False, "notice": "That session is no longer in V$SESSION."}
+    return {"found": True, "notice": None, **rows[0]}
+
+
+_SESSION_SQL = """
+SELECT s.sql_id AS "sql_id",
+       s.sql_child_number AS "sql_child_number",
+       TO_CHAR(s.sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS "sql_exec_start",
+       s.prev_sql_id AS "prev_sql_id",
+       s.prev_child_number AS "prev_child_number",
+       TO_CHAR(s.prev_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS "prev_exec_start",
+       (
+           SELECT SUBSTR(q.sql_text, 1, 4000)
+           FROM v$sql q
+           WHERE q.sql_id = s.sql_id
+             AND q.child_number = s.sql_child_number
+             AND ROWNUM = 1
+       ) AS "sql_text",
+       (
+           SELECT SUBSTR(q.sql_text, 1, 4000)
+           FROM v$sql q
+           WHERE q.sql_id = s.prev_sql_id
+             AND q.child_number = s.prev_child_number
+             AND ROWNUM = 1
+       ) AS "prev_sql_text"
+FROM v$session s
+WHERE s.sid = :sid
+  AND s.serial# = :serial
+  AND s.type = 'USER'
+"""
+
+_SESSION_SQL_IDS = """
+SELECT sql_id AS "sql_id",
+       prev_sql_id AS "prev_sql_id"
+FROM v$session
+WHERE sid = :sid
+  AND serial# = :serial
+  AND type = 'USER'
+"""
 
 
 def kill_session_sql(sid: int, serial: int) -> str:

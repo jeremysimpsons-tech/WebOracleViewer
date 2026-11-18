@@ -37,7 +37,9 @@ flowchart LR
 
 Pages are Jinja templates. The worksheet is a textarea and `fetch`. There is no Node build, so a Red Hat host only needs Python. Appearance is a `data-theme` attribute on the page (`dark`, `light`, `midnight`, `harbor`, `sand`, or `contrast`), saved in the browser as `e1p-theme`. The server does not store the theme.
 
-A paged `SELECT` keeps its Oracle cursor on the working connection. **Next** calls `fetchmany` for one more page. The cursor is closed when the result ends, when the worksheet runs again, or when that connection closes. Earlier pages stay in the browser only. The query library is one JSON file for the server operator.
+A paged `SELECT` keeps its Oracle cursor on the working connection. **Next** calls `fetchmany` for one more page. The cursor is closed when the result ends, when the worksheet runs again, when it has had no **Next** for 2 minutes, or when that connection closes. A locking statement does not keep a cursor when that setting is on. Earlier pages stay in the browser only. The query library and the client settings are JSON files for the server operator.
+
+Uncommitted work is rolled back after 5 minutes idle. The Oracle session stays until the longer idle timeout, disconnect, sign-out, or the browser tab closing. **Cancel** calls `Connection.cancel()` from outside the statement lock and does not roll back. `expire_time` is set on connect when session tagging is on. The session list does not join `V$SQL`; statement text is read for the one selected session.
 
 ## Request path
 

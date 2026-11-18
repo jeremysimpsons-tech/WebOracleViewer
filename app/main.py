@@ -18,6 +18,7 @@ from app.db import SessionRegistry
 from app.errors import AppError
 from app.secretsbox import SecretBox
 from app.library import QueryLibrary
+from app.prefs import ClientPrefs
 from app.store import ConnectionStore
 from app.web import router as web_router
 
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
     app.state.registry = SessionRegistry(settings)
     app.state.store = ConnectionStore(settings, SecretBox.from_file(settings.master_key_file))
     app.state.library = QueryLibrary(settings)
+    app.state.prefs = ClientPrefs(settings)
     from app.security import LoginLimiter
 
     app.state.limiter = LoginLimiter(settings.login_max_failures, settings.login_window_seconds)

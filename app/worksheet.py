@@ -10,7 +10,7 @@ import oracledb
 
 from app.db import DbHandle, connection_lost, jsonable
 from app.errors import AppError, redact
-from app.sqlsplit import prepare_for_driver, split_script, statement_kind
+from app.sqlsplit import is_locking_sql, needs_ddl_confirm, prepare_for_driver, split_script, statement_kind
 
 
 class BindsRequired(Exception):
@@ -40,6 +40,10 @@ def execute_script(
     autocommit: bool,
     binds: dict[str, Any] | None,
     secrets: list[str],
+    *,
+    confirm_ddl: bool = False,
+    block_locking_sql: bool = True,
+    rollback_script_on_error: bool = True,
 ) -> dict:
     items = split_script(sql)
     if not items:
@@ -52,6 +56,22 @@ def execute_script(
                 "SET SERVEROUTPUT and PROMPT are accepted."
             )
     ensure_allowed(items, handle.read_only)
+    if block_locking_sql:
+        for index, item in enumerate(items, start=1):
+            if item.kind == "sql" and is_locking_sql(item.text) and handle.read_only:
+                raise AppError(
+                    f"Statement {index} locks rows (SELECT FOR UPDATE or LOCK TABLE). "
+                    "This connection is read only, and Settings blocks locking SQL.",
+                    403,
+                )
+    if any(item.kind == "sql" and needs_ddl_confirm(item.text) for item in items) and not confirm_ddl:
+        raise AppError(
+            "This script includes DROP, TRUNCATE, GRANT, REVOKE, CREATE, PURGE, "
+            "FLASHBACK, RENAME, or ALTER (other than ALTER SESSION). "
+            "It can change or remove data and objects. Confirm to run it.",
+            409,
+            {"code": "confirm_ddl"},
+        )
     _close_pages(handle)
     clean_binds = _coerce_binds(binds)
     page_size = _page_size(max_rows)
@@ -77,14 +97,25 @@ def execute_script(
                 results.append({"index": index, "kind": "message", "text": item.text})
                 continue
             try:
-                results.append(_run_one(handle, index, item.text, page_size, clean_binds))
+                results.append(
+                    _run_one(
+                        handle,
+                        index,
+                        item.text,
+                        page_size,
+                        clean_binds,
+                        keep_page=not (block_locking_sql and is_locking_sql(item.text)),
+                    )
+                )
             except BindsRequired as exc:
-                return _done(
+                return _fail(
                     handle,
-                    ok=False,
-                    results=results,
-                    collect_output=collect_output,
-                    error={
+                    connection,
+                    rollback_script_on_error,
+                    False,
+                    results,
+                    collect_output,
+                    {
                         "message": "Statement "
                         + str(index)
                         + " needs bind values for: "
@@ -92,33 +123,40 @@ def execute_script(
                         + ". Enter them as a JSON object, for example {\"id\": 10}.",
                         "statement": index,
                     },
-                    stopped_at=index,
+                    index,
                     code="binds_required",
                     bind_names=exc.names,
                 )
             except oracledb.Error as exc:
                 if connection_lost(exc):
                     raise
-                return _done(
+                message = redact(str(exc).strip(), secrets)
+                return _fail(
                     handle,
-                    ok=False,
-                    results=results,
-                    collect_output=collect_output,
-                    error={"message": redact(str(exc).strip(), secrets), "statement": index},
-                    stopped_at=index,
+                    connection,
+                    rollback_script_on_error,
+                    _cancelled(exc),
+                    results,
+                    collect_output,
+                    {"message": message, "statement": index},
+                    index,
                 )
     except oracledb.Error as exc:
         if connection_lost(exc):
             raise
-        return _done(
+        return _fail(
             handle,
-            ok=False,
-            results=results,
-            collect_output=collect_output,
-            error={"message": redact(str(exc).strip(), secrets), "statement": None},
-            stopped_at=None,
+            connection,
+            rollback_script_on_error,
+            _cancelled(exc),
+            results,
+            collect_output,
+            {"message": redact(str(exc).strip(), secrets), "statement": None},
+            None,
         )
-    return _done(handle, ok=True, results=results, collect_output=collect_output, error=None, stopped_at=None)
+    payload = _done(handle, ok=True, results=results, collect_output=collect_output, error=None, stopped_at=None)
+    payload["rolled_back"] = False
+    return payload
 
 
 def fetch_next_page(handle: DbHandle, token: str) -> dict:
@@ -143,6 +181,7 @@ def fetch_next_page(handle: DbHandle, token: str) -> dict:
     if cursor.description:
         columns = [item[0] for item in cursor.description]
     slot["page"] += 1
+    slot["touched"] = time.time()
     start = slot["fetched"] + 1
     slot["fetched"] += len(visible)
     if not has_more:
@@ -159,7 +198,15 @@ def fetch_next_page(handle: DbHandle, token: str) -> dict:
     }
 
 
-def _run_one(handle: DbHandle, index: int, sql: str, page_size: int, binds: dict) -> dict:
+def _run_one(
+    handle: DbHandle,
+    index: int,
+    sql: str,
+    page_size: int,
+    binds: dict,
+    *,
+    keep_page: bool = True,
+) -> dict:
     statement = prepare_for_driver(sql)
     if not statement:
         raise AppError(f"Statement {index} is empty.")
@@ -190,7 +237,8 @@ def _run_one(handle: DbHandle, index: int, sql: str, page_size: int, binds: dict
             has_more = len(fetched) == page_size
             rows = [[jsonable(value) for value in row] for row in fetched]
             token = None
-            if has_more:
+            paging_closed = False
+            if has_more and keep_page:
                 token = secrets.token_urlsafe(18)
                 handle.page_cursors[token] = {
                     "cursor": cursor,
@@ -198,8 +246,12 @@ def _run_one(handle: DbHandle, index: int, sql: str, page_size: int, binds: dict
                     "page": 1,
                     "fetched": len(rows),
                     "columns": columns,
+                    "touched": time.time(),
                 }
                 kept = True
+            elif has_more:
+                has_more = False
+                paging_closed = True
             return {
                 "index": index,
                 "kind": "query",
@@ -214,6 +266,7 @@ def _run_one(handle: DbHandle, index: int, sql: str, page_size: int, binds: dict
                 "page": 1,
                 "row_start": 1 if rows else 0,
                 "elapsed_ms": elapsed,
+                "paging_closed": paging_closed,
             }
         kind = statement_kind(statement)
         row_count = cursor.rowcount
@@ -229,6 +282,47 @@ def _run_one(handle: DbHandle, index: int, sql: str, page_size: int, binds: dict
     finally:
         if not kept:
             cursor.close()
+
+
+def _fail(
+    handle: DbHandle,
+    connection,
+    rollback_script: bool,
+    cancelled: bool,
+    results: list[dict],
+    collect_output: bool,
+    error: dict,
+    stopped_at: int | None,
+    code: str | None = None,
+    bind_names: list[str] | None = None,
+) -> dict:
+    rolled = False
+    if rollback_script and not cancelled:
+        try:
+            connection.rollback()
+            rolled = True
+        except oracledb.Error:
+            rolled = False
+    payload = _done(
+        handle,
+        ok=False,
+        results=results,
+        collect_output=collect_output,
+        error=error,
+        stopped_at=stopped_at,
+        code=code,
+        bind_names=bind_names,
+    )
+    payload["rolled_back"] = rolled
+    if cancelled and error.get("message"):
+        error["message"] = (
+            "The statement was cancelled. Uncommitted work is still open. " + error["message"]
+        )
+    return payload
+
+
+def _cancelled(exc: BaseException) -> bool:
+    return "ORA-01013" in str(exc).upper()
 
 
 def _done(
